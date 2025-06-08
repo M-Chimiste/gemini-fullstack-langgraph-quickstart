@@ -32,6 +32,7 @@ from agent.utils import (
     get_research_topic,
 )
 from inference.llm import LLMModelFactory, SentenceTransformerInference
+from agent.model_router import load_model_router
 
 load_dotenv()
 
@@ -51,6 +52,9 @@ embedding_model = SentenceTransformerInference()
 paper_db = PaperDatabase(Path(os.environ.get("PAPER_DB_PATH", "papers.db")))
 local_tool = LocalSearchTool(paper_db, embedding_model)
 external_tool = ExternalSearchTool()
+
+# Load the model router which manages model selection per node
+model_router = load_model_router()
 
 
 # Nodes
@@ -73,12 +77,8 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     if state.get("initial_search_query_count") is None:
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
-    # Initialise the language model via the inference layer
-    llm = LLMModelFactory.create_model(
-        "gemini",
-        model_name=configurable.query_generator_model,
-        temperature=1.0,
-    )
+    # Initialise the language model via the model router
+    llm = model_router.get_model("generate_query")
 
     # Format the prompt
     current_date = get_current_date()
@@ -135,9 +135,8 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
         Dictionary with state update, including search_query key containing the generated follow-up query
     """
     configurable = Configuration.from_runnable_config(config)
-    # Increment the research loop count and get the reasoning model
+    # Increment the research loop count
     state["research_loop_count"] = state.get("research_loop_count", 0) + 1
-    reasoning_model = state.get("reasoning_model") or configurable.reasoning_model
 
     # Format the prompt
     current_date = get_current_date()
@@ -146,12 +145,8 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
         research_topic=get_research_topic(state["messages"]),
         summaries="\n\n---\n\n".join(state["web_research_result"]),
     )
-    # Initialise the reasoning model via the inference layer
-    llm = LLMModelFactory.create_model(
-        "gemini",
-        model_name=reasoning_model,
-        temperature=1.0,
-    )
+    # Initialise the reasoning model via the model router
+    llm = model_router.get_model("reflection")
     result = llm.invoke([], formatted_prompt, schema=Reflection)
 
     return {
@@ -214,7 +209,6 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         Dictionary with state update, including running_summary key containing the formatted final summary with sources
     """
     configurable = Configuration.from_runnable_config(config)
-    reasoning_model = state.get("reasoning_model") or configurable.reasoning_model
 
     # Format the prompt
     current_date = get_current_date()
@@ -224,12 +218,8 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         summaries="\n---\n\n".join(state["web_research_result"]),
     )
 
-    # Initialise the reasoning model via the inference layer
-    llm = LLMModelFactory.create_model(
-        "gemini",
-        model_name=reasoning_model,
-        temperature=0,
-    )
+    # Initialise the reasoning model via the model router
+    llm = model_router.get_model("finalize_answer")
     result = llm.invoke([], formatted_prompt)
 
     # Replace the short urls with the original urls and add all used urls to the sources_gathered
