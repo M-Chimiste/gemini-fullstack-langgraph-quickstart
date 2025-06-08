@@ -315,10 +315,15 @@ class GeminiInference(InferenceModel):
 
     def _load_model(self):
         import google.generativeai as genai
-        
-        # Configure API key
-        genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
-        
+
+        # Configure API key.  "GOOGLE_API_KEY" is preferred but fall back to the
+        # legacy "GEMINI_API_KEY" used elsewhere in the repository.
+        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise EnvironmentError("GOOGLE_API_KEY environment variable is not set")
+
+        genai.configure(api_key=api_key)
+
         return genai
     
     def invoke(self,
@@ -378,6 +383,10 @@ class GeminiInference(InferenceModel):
         if schema is not None:
             request_kwargs["response_mime_type"] = "application/json"
             request_kwargs["response_schema"] = schema   # e.g. list[MySchema]
+
+        # Allow callers to provide additional generation parameters such as
+        # `tools` for Google search or custom timeouts via **kwargs.
+        request_kwargs.update(kwargs)
 
         # --- STREAMING -----------------------------------------------------
         if streaming:

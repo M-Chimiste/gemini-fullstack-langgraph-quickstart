@@ -7,7 +7,7 @@ from langgraph.types import Send
 from langgraph.graph import StateGraph
 from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
-from google.genai import Client
+from inference.llm import LLMModelFactory
 
 from agent.state import (
     OverallState,
@@ -23,7 +23,6 @@ from agent.prompts import (
     reflection_instructions,
     answer_instructions,
 )
-from langchain_google_genai import ChatGoogleGenerativeAI
 from agent.utils import (
     get_citations,
     get_research_topic,
@@ -33,11 +32,16 @@ from agent.utils import (
 
 load_dotenv()
 
-if os.getenv("GEMINI_API_KEY") is None:
-    raise ValueError("GEMINI_API_KEY is not set")
+# Normalise environment variables for the inference layer.  The llm.py helpers
+# expect `GOOGLE_API_KEY`, but older configs may provide `GEMINI_API_KEY`.
+if os.getenv("GOOGLE_API_KEY") is None and os.getenv("GEMINI_API_KEY"):
+    os.environ["GOOGLE_API_KEY"] = os.getenv("GEMINI_API_KEY")
 
-# Used for Google Search API
-genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
+if os.getenv("GOOGLE_API_KEY") is None:
+    raise ValueError("GOOGLE_API_KEY is not set")
+
+# Used for Google Search API via the Gemini client
+genai_client = LLMModelFactory.create_model("gemini").client
 
 
 # Nodes
@@ -60,14 +64,12 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     if state.get("initial_search_query_count") is None:
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
-    # init Gemini 2.0 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=configurable.query_generator_model,
+    # Initialise the language model via the inference layer
+    llm = LLMModelFactory.create_model(
+        "gemini",
+        model_name=configurable.query_generator_model,
         temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
     )
-    structured_llm = llm.with_structured_output(SearchQueryList)
 
     # Format the prompt
     current_date = get_current_date()
@@ -76,8 +78,8 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
         research_topic=get_research_topic(state["messages"]),
         number_queries=state["initial_search_query_count"],
     )
-    # Generate the search queries
-    result = structured_llm.invoke(formatted_prompt)
+    # Generate the search queries using structured output
+    result = llm.invoke([], formatted_prompt, schema=SearchQueryList)
     return {"query_list": result.query}
 
 
@@ -111,7 +113,8 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
         research_topic=state["search_query"],
     )
 
-    # Uses the google genai client as the langchain client doesn't return grounding metadata
+    # Use the Gemini client directly because the inference abstraction does not
+    # expose grounding metadata required for citation extraction.
     response = genai_client.models.generate_content(
         model=configurable.query_generator_model,
         contents=formatted_prompt,
@@ -162,14 +165,13 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
         research_topic=get_research_topic(state["messages"]),
         summaries="\n\n---\n\n".join(state["web_research_result"]),
     )
-    # init Reasoning Model
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
+    # Initialise the reasoning model via the inference layer
+    llm = LLMModelFactory.create_model(
+        "gemini",
+        model_name=reasoning_model,
         temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
     )
-    result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
+    result = llm.invoke([], formatted_prompt, schema=Reflection)
 
     return {
         "is_sufficient": result.is_sufficient,
@@ -241,14 +243,13 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         summaries="\n---\n\n".join(state["web_research_result"]),
     )
 
-    # init Reasoning Model, default to Gemini 2.5 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
+    # Initialise the reasoning model via the inference layer
+    llm = LLMModelFactory.create_model(
+        "gemini",
+        model_name=reasoning_model,
         temperature=0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
     )
-    result = llm.invoke(formatted_prompt)
+    result = llm.invoke([], formatted_prompt)
 
     # Replace the short urls with the original urls and add all used urls to the sources_gathered
     unique_sources = []
