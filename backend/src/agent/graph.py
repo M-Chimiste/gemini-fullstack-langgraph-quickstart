@@ -1,34 +1,37 @@
-import os
+"""LangGraph workflow wiring for the local-first research agent."""
 
-from agent.tools_and_schemas import SearchQueryList, Reflection
+import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage
-from langgraph.types import Send
-from langgraph.graph import StateGraph
-from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
-from inference.llm import LLMModelFactory
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
 
+from agent.configuration import Configuration
+from agent.external_search import ExternalSearchTool
+from agent.local_search import (
+    LocalSearchTool,
+    PaperDatabase,  # type: ignore
+)
+from agent.prompts import (
+    answer_instructions,
+    get_current_date,
+    query_writer_instructions,
+    reflection_instructions,
+)
 from agent.state import (
     OverallState,
     QueryGenerationState,
     ReflectionState,
     WebSearchState,
 )
-from agent.configuration import Configuration
-from agent.prompts import (
-    get_current_date,
-    query_writer_instructions,
-    web_searcher_instructions,
-    reflection_instructions,
-    answer_instructions,
-)
+from agent.tools_and_schemas import Reflection, SearchQueryList
 from agent.utils import (
-    get_citations,
     get_research_topic,
-    insert_citation_markers,
-    resolve_urls,
 )
+from inference.llm import LLMModelFactory, SentenceTransformerInference
 
 load_dotenv()
 
@@ -42,6 +45,12 @@ if os.getenv("GOOGLE_API_KEY") is None:
 
 # Used for Google Search API via the Gemini client
 genai_client = LLMModelFactory.create_model("gemini").client
+
+# Initialise search tools
+embedding_model = SentenceTransformerInference()
+paper_db = PaperDatabase(Path(os.environ.get("PAPER_DB_PATH", "papers.db")))
+local_tool = LocalSearchTool(paper_db, embedding_model)
+external_tool = ExternalSearchTool()
 
 
 # Nodes
@@ -83,59 +92,31 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     return {"query_list": result.query}
 
 
-def continue_to_web_research(state: QueryGenerationState):
-    """LangGraph node that sends the search queries to the web research node.
-
-    This is used to spawn n number of web research nodes, one for each search query.
-    """
+def continue_to_local_research(state: QueryGenerationState):
+    """Spawn a local search node for each generated query."""
     return [
-        Send("web_research", {"search_query": search_query, "id": int(idx)})
+        Send("local_research", {"search_query": search_query, "id": int(idx)})
         for idx, search_query in enumerate(state["query_list"])
     ]
 
 
-def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
-    """LangGraph node that performs web research using the native Google Search API tool.
-
-    Executes a web search using the native Google Search API tool in combination with Gemini 2.0 Flash.
-
-    Args:
-        state: Current graph state containing the search query and research loop count
-        config: Configuration for the runnable, including search API settings
-
-    Returns:
-        Dictionary with state update, including sources_gathered, research_loop_count, and web_research_results
-    """
-    # Configure
-    configurable = Configuration.from_runnable_config(config)
-    formatted_prompt = web_searcher_instructions.format(
-        current_date=get_current_date(),
-        research_topic=state["search_query"],
-    )
-
-    # Use the Gemini client directly because the inference abstraction does not
-    # expose grounding metadata required for citation extraction.
-    response = genai_client.models.generate_content(
-        model=configurable.query_generator_model,
-        contents=formatted_prompt,
-        config={
-            "tools": [{"google_search": {}}],
-            "temperature": 0,
-        },
-    )
-    # resolve the urls to short urls for saving tokens and time
-    resolved_urls = resolve_urls(
-        response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
-    )
-    # Gets the citations and adds them to the generated text
-    citations = get_citations(response, resolved_urls)
-    modified_text = insert_citation_markers(response.text, citations)
-    sources_gathered = [item for citation in citations for item in citation["segments"]]
-
+def local_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
+    """Perform a search over the local paper database."""
+    result = local_tool.find_papers_by_str(state["search_query"], limit=5)
     return {
-        "sources_gathered": sources_gathered,
+        "sources_gathered": [],
         "search_query": [state["search_query"]],
-        "web_research_result": [modified_text],
+        "web_research_result": [result],
+    }
+
+
+def external_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
+    """Fallback search using the Semantic Scholar API."""
+    result = external_tool.find_papers_by_str(state["search_query"], limit=5)
+    return {
+        "sources_gathered": [],
+        "search_query": [state["search_query"]],
+        "web_research_result": [result],
     }
 
 
@@ -196,7 +177,7 @@ def evaluate_research(
         config: Configuration for the runnable, including max_research_loops setting
 
     Returns:
-        String literal indicating the next node to visit ("web_research" or "finalize_summary")
+        String literal indicating the next node to visit ("external_research" or "finalize_summary")
     """
     configurable = Configuration.from_runnable_config(config)
     max_research_loops = (
@@ -209,7 +190,7 @@ def evaluate_research(
     else:
         return [
             Send(
-                "web_research",
+                "external_research",
                 {
                     "search_query": follow_up_query,
                     "id": state["number_of_ran_queries"] + int(idx),
@@ -271,7 +252,8 @@ builder = StateGraph(OverallState, config_schema=Configuration)
 
 # Define the nodes we will cycle between
 builder.add_node("generate_query", generate_query)
-builder.add_node("web_research", web_research)
+builder.add_node("local_research", local_research)
+builder.add_node("external_research", external_research)
 builder.add_node("reflection", reflection)
 builder.add_node("finalize_answer", finalize_answer)
 
@@ -280,15 +262,16 @@ builder.add_node("finalize_answer", finalize_answer)
 builder.add_edge(START, "generate_query")
 # Add conditional edge to continue with search queries in a parallel branch
 builder.add_conditional_edges(
-    "generate_query", continue_to_web_research, ["web_research"]
+    "generate_query", continue_to_local_research, ["local_research"]
 )
-# Reflect on the web research
-builder.add_edge("web_research", "reflection")
+# Reflect on the search
+builder.add_edge("local_research", "reflection")
+builder.add_edge("external_research", "reflection")
 # Evaluate the research
 builder.add_conditional_edges(
-    "reflection", evaluate_research, ["web_research", "finalize_answer"]
+    "reflection", evaluate_research, ["external_research", "finalize_answer"]
 )
 # Finalize the answer
 builder.add_edge("finalize_answer", END)
 
-graph = builder.compile(name="pro-search-agent")
+graph = builder.compile(name="local-first-agent")

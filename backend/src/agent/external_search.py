@@ -1,12 +1,20 @@
-import time
+"""Utilities for searching papers using Semantic Scholar."""
+
+import os
 import random
-from typing import List, Dict, Optional
+import tempfile
+import time
+from typing import Dict, List, Optional
+
 import requests
+
+from ..pdf.parsers import FlatMarkdownParser
+from ..pdf.processing import SpacyLayoutDocProcessor
+from .local_search import BaseSearchTool
 
 
 class SemanticScholarSearch:
-    """
-    A class for performing semantic searches on the Semantic Scholar API.
+    """A class for performing semantic searches on the Semantic Scholar API.
 
     This class provides a convenient interface for searching papers on the Semantic Scholar API. It handles the construction of the search query, sending the request, and parsing the response. The search results are returned as a list of dictionaries, each representing a paper and its details.
 
@@ -25,6 +33,7 @@ class SemanticScholarSearch:
         backoff_factor: float = 1.5,
         session: Optional[requests.Session] = None,
     ):
+        """Initialize the searcher."""
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
         # Re-use a session for connection pooling
@@ -45,8 +54,7 @@ class SemanticScholarSearch:
         require_pdf: bool = True,
         fields: Optional[List[str]] = None,
     ) -> List[Dict]:
-        """
-        Performs a search on Semantic Scholar using the provided query and parameters.
+        """Perform a search on Semantic Scholar using the provided query and parameters.
 
         Args:
             query (str): The search query to execute.
@@ -100,21 +108,21 @@ class SemanticScholarSearch:
                 resp.raise_for_status()
                 return resp.json()
 
-            except (requests.exceptions.RetryError, requests.exceptions.RequestException) as e:
+            except (
+                requests.exceptions.RetryError,
+                requests.exceptions.RequestException,
+            ) as e:
                 if retries >= self.max_retries:
                     raise RuntimeError(f"Semantic Scholar API request failed: {e}")
 
                 # Exponential back-off with jitter
-                sleep_for = self.backoff_factor * (2 ** retries) + random.uniform(
-                    0, 1
-                )
+                sleep_for = self.backoff_factor * (2**retries) + random.uniform(0, 1)
                 time.sleep(sleep_for)
                 retries += 1
 
     @staticmethod
     def _normalize_paper(paper: Dict) -> Dict:
-        """
-        Normalize a paper dictionary by flattening its structure and adding a 'pdf_url' field if available.
+        """Normalize a paper dictionary by flattening its structure and adding a 'pdf_url' field if available.
 
         This method takes a paper dictionary as input, which may contain nested structures. It flattens the dictionary
         by removing any nested structures and adding the 'pdf_url' field if the paper has an open access PDF available.
@@ -135,3 +143,72 @@ class SemanticScholarSearch:
         if pdf_url:
             flat["pdf_url"] = pdf_url
         return flat
+
+
+class ExternalSearchTool(BaseSearchTool):
+    """Search tool that queries Semantic Scholar and optionally downloads PDFs."""
+
+    def __init__(self, enable_pdf_download: bool = True):
+        """Create a new tool instance."""
+        self.searcher = SemanticScholarSearch()
+        self.enable_pdf_download = enable_pdf_download
+        self.pdf_processor = SpacyLayoutDocProcessor(
+            language="en",
+            save_text=False,
+            export_tables=False,
+            export_figures=False,
+            remove_md_image_tags=True,
+        )
+
+    def find_papers_by_str(self, query: str, limit: int = 10) -> str:
+        """Search Semantic Scholar and return a formatted summary."""
+        try:
+            papers = self.searcher.search(query, limit=limit)
+        except Exception as e:  # pragma: no cover - network failure handling
+            return f"External search failed: {e}"
+
+        if not papers:
+            return f"No papers found for query: '{query}'"
+
+        formatted = []
+        for paper in papers:
+            info = (
+                f"Title: {paper.get('title')}\n"
+                f"Year: {paper.get('year')}\n"
+                f"URL: {paper.get('url')}\n"
+            )
+            if paper.get("pdf_url"):
+                info += f"PDF: {paper['pdf_url']}\n"
+            if paper.get("abstract"):
+                info += f"Abstract: {paper['abstract'][:300]}...\n"
+            formatted.append(info + "---")
+
+        return f"Found {len(papers)} papers for query: '{query}'\n\n" + "\n".join(
+            formatted
+        )
+
+    def retrieve_full_text(self, paper_id: str) -> str:
+        """Download and process a PDF from the provided URL."""
+        if not self.enable_pdf_download:
+            return "PDF download disabled."
+        return self._download_and_process_pdf(paper_id)
+
+    def _download_and_process_pdf(self, url: str) -> str:
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                response = requests.get(url, timeout=30)
+                response.raise_for_status()
+                tmp.write(response.content)
+                tmp_path = tmp.name
+
+            try:
+                result = self.pdf_processor.process_document(tmp_path)
+                markdown_text = result.get("processed_data", "")
+                parser = FlatMarkdownParser(markdown_text, max_tokens=60000)
+                parsed_chunks = parser.get_parsed_data()
+                return "\n".join(parsed_chunks)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+        except Exception as e:  # pragma: no cover - network failure handling
+            return f"Error processing PDF from {url}: {e}"
